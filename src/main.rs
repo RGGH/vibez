@@ -1,7 +1,11 @@
 use std::io::{self, Write};
 use std::time::Duration;
 use std::f32::consts::PI;
+use std::fs;
+use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use dialoguer::{Select, Input, Confirm, theme::ColorfulTheme};
+use serde::{Deserialize, Serialize};
 
 //
 // =========================
@@ -9,7 +13,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 // =========================
 //
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Waveform { Sine, Saw, Square, Triangle }
 
 #[derive(Clone, Debug)]
@@ -93,18 +97,51 @@ fn note_to_semitone(name: &str) -> i32 {
 
 //
 // =========================
+//   T R A C K
+// =========================
+//
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Track {
+    pub name: String,
+    pub pattern: Vec<i32>,
+    pub octave: i32,
+    pub transpose: i32,
+    pub waveform: Waveform,
+    pub voice_spread: i32,
+}
+
+impl Track {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            pattern: vec![0],
+            octave: 3,
+            transpose: 0,
+            waveform: Waveform::Saw,
+            voice_spread: 7,
+        }
+    }
+}
+
+//
+// =========================
 //   S E Q U E N C E R
 // =========================
 //
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectData {
+    pub tracks: Vec<Track>,
+    pub scale: Vec<i32>,
+    pub bpm: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Sequencer {
-    pub pattern: Vec<i32>,
+    pub tracks: Vec<Track>,
     pub scale: Vec<i32>,
-    pub octave: i32,
-    pub transpose: i32,
-    pub waveform: Waveform,
-    pub voices: Vec<Voice>,
+    pub voices: Vec<Vec<Voice>>,
 
     pub sample_rate: f32,
     pub step: usize,
@@ -114,15 +151,10 @@ pub struct Sequencer {
 
 impl Sequencer {
     pub fn new(sample_rate: f32) -> Self {
-        let mut voices = Vec::new();
-        for _ in 0..3 { voices.push(Voice::new()); }
         Self {
-            pattern: vec![0],
+            tracks: vec![Track::new("Main")],
             scale: minor_scale("g"),
-            octave: 3,
-            transpose: 0,
-            waveform: Waveform::Saw,
-            voices,
+            voices: vec![vec![Voice::new(); 3]],
             sample_rate,
             step: 0,
             samples_per_step: (sample_rate/4.0) as usize,
@@ -130,28 +162,83 @@ impl Sequencer {
         }
     }
 
+    pub fn from_project(project: ProjectData, sample_rate: f32) -> Self {
+        let num_tracks = project.tracks.len();
+        let mut voices = Vec::new();
+        for _ in 0..num_tracks {
+            voices.push(vec![Voice::new(); 3]);
+        }
+        
+        Self {
+            tracks: project.tracks,
+            scale: project.scale,
+            voices,
+            sample_rate,
+            step: 0,
+            samples_per_step: (sample_rate * 60.0 / project.bpm / 4.0) as usize,
+            sample_counter: 0,
+        }
+    }
+
+    pub fn add_track(&mut self, track: Track) {
+        self.tracks.push(track);
+        self.voices.push(vec![Voice::new(); 3]);
+    }
+
     pub fn process(&mut self) -> f32 {
         self.sample_counter += 1;
         if self.sample_counter >= self.samples_per_step {
             self.sample_counter = 0;
-            self.step = (self.step + 1) % self.pattern.len();
+            self.step = (self.step + 1) % self.get_max_pattern_len();
             self.trigger_step();
         }
 
-        // mix voices
-        self.voices.iter_mut().map(|v| v.process(self.sample_rate)).sum::<f32>() / self.voices.len() as f32
+        // mix all tracks
+        let mut sum = 0.0;
+        let mut voice_count = 0;
+        for voices in &mut self.voices {
+            for v in voices {
+                sum += v.process(self.sample_rate);
+                voice_count += 1;
+            }
+        }
+        if voice_count > 0 {
+            sum / voice_count as f32
+        } else {
+            0.0
+        }
+    }
+
+    fn get_max_pattern_len(&self) -> usize {
+        self.tracks.iter().map(|t| t.pattern.len()).max().unwrap_or(1)
     }
 
     fn trigger_step(&mut self) {
-        let note = self.pattern[self.step % self.pattern.len()];
-        let scale_note = self.scale[(note as usize) % self.scale.len()];
-        let midi_base = scale_note + self.transpose + self.octave*12;
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            if track.pattern.is_empty() { continue; }
+            
+            let note = track.pattern[self.step % track.pattern.len()];
+            if note < 0 { continue; } // rest
+            
+            let scale_note = self.scale[(note as usize) % self.scale.len()];
+            let midi_base = scale_note + track.transpose + track.octave*12;
 
-        for (i,v) in self.voices.iter_mut().enumerate() {
-            let freq = midi_to_freq(midi_base + i as i32*7); // spread voices
-            v.set_frequency(freq);
-            v.waveform = self.waveform;
-            v.reset_env();
+            if track_idx < self.voices.len() {
+                for (i, v) in self.voices[track_idx].iter_mut().enumerate() {
+                    let freq = midi_to_freq(midi_base + i as i32 * track.voice_spread);
+                    v.set_frequency(freq);
+                    v.waveform = track.waveform;
+                    v.reset_env();
+                }
+            }
+        }
+    }
+
+    pub fn to_project(&self, bpm: f32) -> ProjectData {
+        ProjectData {
+            tracks: self.tracks.clone(),
+            scale: self.scale.clone(),
+            bpm,
         }
     }
 }
@@ -162,7 +249,7 @@ impl Sequencer {
 // =========================
 //
 
-fn play_audio(mut seq: Sequencer) {
+fn play_audio(seq: Arc<Mutex<Sequencer>>) {
     let host = cpal::default_host();
     let device = host.default_output_device().expect("no output device");
     let config = device.default_output_config().unwrap();
@@ -171,22 +258,35 @@ fn play_audio(mut seq: Sequencer) {
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => {
             let cfg = config.clone().into();
+            let seq = seq.clone();
             device.build_output_stream(&cfg, move |data: &mut [f32], _| {
-                for s in data { *s = seq.process(); }
+                if let Ok(mut s) = seq.lock() {
+                    for sample in data { 
+                        *sample = s.process(); 
+                    }
+                }
             }, err_fn, None).unwrap()
         }
         cpal::SampleFormat::I16 => {
             let cfg = config.clone().into();
+            let seq = seq.clone();
             device.build_output_stream(&cfg, move |data: &mut [i16], _| {
-                for s in data { *s = (seq.process()*i16::MAX as f32) as i16; }
+                if let Ok(mut s) = seq.lock() {
+                    for sample in data { 
+                        *sample = (s.process()*i16::MAX as f32) as i16; 
+                    }
+                }
             }, err_fn, None).unwrap()
         }
         cpal::SampleFormat::U16 => {
             let cfg = config.clone().into();
+            let seq = seq.clone();
             device.build_output_stream(&cfg, move |data: &mut [u16], _| {
-                for s in data {
-                    let v = (seq.process()*0.5+0.5).clamp(0.0,1.0);
-                    *s = (v*u16::MAX as f32) as u16;
+                if let Ok(mut s) = seq.lock() {
+                    for sample in data {
+                        let v = (s.process()*0.5+0.5).clamp(0.0,1.0);
+                        *sample = (v*u16::MAX as f32) as u16;
+                    }
                 }
             }, err_fn, None).unwrap()
         }
@@ -194,7 +294,7 @@ fn play_audio(mut seq: Sequencer) {
     };
 
     stream.play().unwrap();
-    println!("🎶 Audio running. Ctrl+C to quit.");
+    // Silently run - don't print to console
     loop { std::thread::sleep(Duration::from_secs(1)); }
 }
 
@@ -204,25 +304,240 @@ fn play_audio(mut seq: Sequencer) {
 // =========================
 //
 
-fn parse_line(line: &str, seq: &mut Sequencer) {
-    if line.starts_with("n\"") && line.ends_with("\"") {
-        let inside = &line[2..line.len()-1];
-        seq.pattern = inside.split_whitespace().filter_map(|x| x.parse::<i32>().ok()).collect();
+fn parse_track_line(line: &str) -> Option<Track> {
+    let mut track = Track::new("Untitled");
+    
+    // Parse pattern: n"0 3 5 7"
+    if let Some(start) = line.find("n\"") {
+        if let Some(end_pos) = line[start+2..].find("\"") {
+            let inside = &line[start+2..start+2+end_pos];
+            track.pattern = inside.split_whitespace()
+                .filter_map(|x| x.parse::<i32>().ok())
+                .collect();
+        }
     }
-    if line.contains(".scale(") && line.contains("minor") {
-        seq.scale = minor_scale("g");
-    }
+    
+    // Parse octave: .o(3)
     if line.contains(".o(") {
-        if let Ok(oct) = line.split(|c| c=='(' || c==')').nth(1).unwrap_or("3").parse() { seq.octave=oct; }
+        if let Some(open) = line.find(".o(") {
+            if let Some(close) = line[open..].find(")") {
+                let val = &line[open+3..open+close];
+                if let Ok(oct) = val.parse() { track.octave = oct; }
+            }
+        }
     }
+    
+    // Parse transpose: .trans(5)
     if line.contains(".trans(") {
-        if let Ok(tr) = line.split(|c| c=='(' || c==')').nth(1).unwrap_or("0").parse() { seq.transpose=tr; }
+        if let Some(open) = line.find(".trans(") {
+            if let Some(close) = line[open..].find(")") {
+                let val = &line[open+7..open+close];
+                if let Ok(tr) = val.parse() { track.transpose = tr; }
+            }
+        }
     }
+    
+    // Parse waveform: .s("saw")
     if line.contains(".s(") {
-        if line.contains("saw") { seq.waveform=Waveform::Saw; }
-        if line.contains("sine") { seq.waveform=Waveform::Sine; }
-        if line.contains("square") { seq.waveform=Waveform::Square; }
-        if line.contains("triangle") { seq.waveform=Waveform::Triangle; }
+        if line.contains("saw") { track.waveform = Waveform::Saw; }
+        else if line.contains("sine") { track.waveform = Waveform::Sine; }
+        else if line.contains("square") { track.waveform = Waveform::Square; }
+        else if line.contains("triangle") { track.waveform = Waveform::Triangle; }
+    }
+    
+    Some(track)
+}
+
+//
+// =========================
+//   I N T E R A C T I V E
+// =========================
+//
+
+fn create_track_interactive(theme: &ColorfulTheme) -> Option<Track> {
+    println!("\n=== Create New Track ===");
+    
+    let name: String = Input::with_theme(theme)
+        .with_prompt("Track name")
+        .default("Synth".to_string())
+        .interact_text()
+        .ok()?;
+    
+    let pattern_str: String = Input::with_theme(theme)
+        .with_prompt("Pattern (space-separated notes, -1 for rest)")
+        .default("0 3 5 7 0 5 3 0".to_string())
+        .interact_text()
+        .ok()?;
+    
+    let pattern: Vec<i32> = pattern_str.split_whitespace()
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    
+    let octave: i32 = Input::with_theme(theme)
+        .with_prompt("Octave")
+        .default(3)
+        .interact_text()
+        .ok()?;
+    
+    let transpose: i32 = Input::with_theme(theme)
+        .with_prompt("Transpose (semitones)")
+        .default(0)
+        .interact_text()
+        .ok()?;
+    
+    let waveforms = vec!["Saw", "Sine", "Square", "Triangle"];
+    let wave_idx = Select::with_theme(theme)
+        .with_prompt("Waveform")
+        .default(0)
+        .items(&waveforms)
+        .interact()
+        .ok()?;
+    
+    let waveform = match wave_idx {
+        0 => Waveform::Saw,
+        1 => Waveform::Sine,
+        2 => Waveform::Square,
+        3 => Waveform::Triangle,
+        _ => Waveform::Saw,
+    };
+    
+    Some(Track {
+        name,
+        pattern,
+        octave,
+        transpose,
+        waveform,
+        voice_spread: 7,
+    })
+}
+
+fn save_project(seq: &Arc<Mutex<Sequencer>>, theme: &ColorfulTheme) {
+    let filename: String = Input::with_theme(theme)
+        .with_prompt("Save as")
+        .default("track.json".to_string())
+        .interact_text()
+        .unwrap();
+    
+    let bpm: f32 = Input::with_theme(theme)
+        .with_prompt("BPM")
+        .default(120.0)
+        .interact_text()
+        .unwrap();
+    
+    if let Ok(s) = seq.lock() {
+        let project = s.to_project(bpm);
+        let json = serde_json::to_string_pretty(&project).unwrap();
+        fs::write(&filename, json).unwrap();
+        println!("✓ Saved to {}", filename);
+    }
+}
+
+fn load_project(theme: &ColorfulTheme) -> Option<ProjectData> {
+    let filename: String = Input::with_theme(theme)
+        .with_prompt("Load file")
+        .default("track.json".to_string())
+        .interact_text()
+        .ok()?;
+    
+    let json = fs::read_to_string(&filename).ok()?;
+    let project: ProjectData = serde_json::from_str(&json).ok()?;
+    println!("✓ Loaded from {}", filename);
+    Some(project)
+}
+
+fn repl_mode(seq: &Arc<Mutex<Sequencer>>) {
+    println!("\n╔═══════════════════════════════════════════════════════════╗");
+    println!("║          R E P L   M O D E                                ║");
+    println!("╚═══════════════════════════════════════════════════════════╝");
+    println!("Build your track line by line. Each line creates/modifies a track.");
+    println!("\nCommands:");
+    println!("  [name] n\"0 3 5 7\" .o(3) .s(\"saw\") .trans(0)");
+    println!("  list              - show all tracks");
+    println!("  clear             - remove all tracks");
+    println!("  delete <name>     - remove a specific track");
+    println!("  exit              - return to main menu");
+    println!("\nExample:");
+    println!("  bass n\"0 0 -1 0\" .o(2) .s(\"sine\")");
+    println!("  lead n\"0 3 5 7 5 3\" .o(4) .s(\"saw\") .trans(5)");
+    println!("  pad n\"0 2 4\" .o(3) .s(\"triangle\")\n");
+
+    loop {
+        print!("repl> ");
+        io::stdout().flush().unwrap();
+        
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        let input = input.trim();
+        
+        if input.is_empty() { continue; }
+        
+        match input {
+            "exit" => {
+                println!("Exiting REPL mode...");
+                break;
+            }
+            "list" => {
+                if let Ok(s) = seq.lock() {
+                    if s.tracks.is_empty() {
+                        println!("  (no tracks)");
+                    } else {
+                        println!("\n=== Current Tracks ===");
+                        for (idx, track) in s.tracks.iter().enumerate() {
+                            println!("  {}. {} - Pattern: {:?}, O:{}, T:{}, W:{:?}", 
+                                idx + 1, track.name, track.pattern, 
+                                track.octave, track.transpose, track.waveform);
+                        }
+                    }
+                }
+            }
+            "clear" => {
+                if let Ok(mut s) = seq.lock() {
+                    s.tracks.clear();
+                    s.voices.clear();
+                    println!("✓ All tracks cleared");
+                }
+            }
+            _ if input.starts_with("delete ") => {
+                let name = input.strip_prefix("delete ").unwrap().trim();
+                if let Ok(mut s) = seq.lock() {
+                    if let Some(pos) = s.tracks.iter().position(|t| t.name == name) {
+                        s.tracks.remove(pos);
+                        s.voices.remove(pos);
+                        println!("✓ Deleted track '{}'", name);
+                    } else {
+                        println!("✗ Track '{}' not found", name);
+                    }
+                }
+            }
+            _ => {
+                // Parse track line
+                let parts: Vec<&str> = input.splitn(2, ' ').collect();
+                if parts.len() < 2 {
+                    println!("✗ Format: <name> n\"pattern\" .o(octave) .s(\"wave\")");
+                    continue;
+                }
+                
+                let name = parts[0];
+                let rest = parts[1];
+                
+                if let Some(mut track) = parse_track_line(rest) {
+                    track.name = name.to_string();
+                    
+                    if let Ok(mut s) = seq.lock() {
+                        // Check if track with same name exists
+                        if let Some(existing) = s.tracks.iter_mut().find(|t| t.name == name) {
+                            *existing = track.clone();
+                            println!("✓ Updated track '{}'", name);
+                        } else {
+                            s.add_track(track);
+                            println!("✓ Added track '{}' (playing now!)", name);
+                        }
+                    }
+                } else {
+                    println!("✗ Failed to parse track");
+                }
+            }
+        }
     }
 }
 
@@ -233,30 +548,150 @@ fn parse_line(line: &str, seq: &mut Sequencer) {
 //
 
 fn main() {
-    let mut seq = Sequencer::new(44100.0);
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if !args.is_empty() {
-        parse_line(&args.join(" "), &mut seq);
+    let theme = ColorfulTheme::default();
+    
+    println!("╔═══════════════════════════════╗");
+    println!("║   V I B E Z  T R A N C E      ║");
+    println!("╚═══════════════════════════════╝\n");
+    
+    let options = vec![
+        "REPL Mode - Build tracks as you go",
+        "Create new track (interactive)",
+        "Import track from file",
+        "Start with example",
+    ];
+    
+    let choice = Select::with_theme(&theme)
+        .with_prompt("What would you like to do?")
+        .default(0)
+        .items(&options)
+        .interact()
+        .unwrap();
+    
+    let seq = match choice {
+        0 => {
+            // REPL Mode - start with empty sequencer
+            let mut s = Sequencer::new(44100.0);
+            s.tracks.clear();
+            s.voices.clear();
+            Arc::new(Mutex::new(s))
+        }
+        1 => {
+            // Create new
+            let mut s = Sequencer::new(44100.0);
+            s.tracks.clear();
+            s.voices.clear();
+            
+            loop {
+                if let Some(track) = create_track_interactive(&theme) {
+                    s.add_track(track);
+                }
+                
+                if !Confirm::with_theme(&theme)
+                    .with_prompt("Add another track?")
+                    .default(false)
+                    .interact()
+                    .unwrap()
+                {
+                    break;
+                }
+            }
+            Arc::new(Mutex::new(s))
+        }
+        2 => {
+            // Import
+            if let Some(project) = load_project(&theme) {
+                Arc::new(Mutex::new(Sequencer::from_project(project, 44100.0)))
+            } else {
+                println!("Failed to load. Using default.");
+                Arc::new(Mutex::new(Sequencer::new(44100.0)))
+            }
+        }
+        3 => {
+            // Example
+            let mut s = Sequencer::new(44100.0);
+            s.tracks.clear();
+            s.voices.clear();
+            
+            let mut bass = Track::new("Bass");
+            bass.pattern = vec![0, 0, -1, 0, 3, 3, -1, 3];
+            bass.octave = 2;
+            bass.waveform = Waveform::Sine;
+            s.add_track(bass);
+            
+            let mut lead = Track::new("Lead");
+            lead.pattern = vec![0, 3, 5, 7, 5, 3, 0, -1];
+            lead.octave = 4;
+            lead.waveform = Waveform::Saw;
+            s.add_track(lead);
+            
+            println!("✓ Loaded example with bass + lead");
+            Arc::new(Mutex::new(s))
+        }
+        _ => Arc::new(Mutex::new(Sequencer::new(44100.0))),
+    };
+    
+    // Display tracks
+    if let Ok(s) = seq.lock() {
+        if !s.tracks.is_empty() {
+            println!("\n=== Loaded Tracks ===");
+            for track in &s.tracks {
+                println!("  • {} (O:{} T:{} W:{:?})", 
+                    track.name, track.octave, track.transpose, track.waveform);
+            }
+        }
     }
-
-    // spawn audio thread
-    let seq_clone = seq.clone();
-    std::thread::spawn(move || { play_audio(seq_clone); });
-
-    // REPL
-    println!("=== vibez trance mode ===");
-    println!("Example: $: n\"0 3 5 7 0 5 3 0\" .scale(\"g:minor\") .o(3) .s(\"saw\")");
-    println!("Type 'quit' to exit\n");
-
+    
+    // Start audio
+    let seq_audio = seq.clone();
+    std::thread::spawn(move || { play_audio(seq_audio); });
+    
+    // Give audio thread time to start
+    std::thread::sleep(Duration::from_millis(100));
+    println!("🎶 Audio running...\n");
+    
+    // If user chose REPL mode, go straight into it
+    if choice == 0 {
+        repl_mode(&seq);
+    }
+    
+    // Menu loop
     loop {
-        print!("> ");
-        io::stdout().flush().unwrap();
-        let mut inp = String::new();
-        io::stdin().read_line(&mut inp).unwrap();
-        let inp = inp.trim();
-        if inp=="quit" { break; }
-        parse_line(inp, &mut seq);
+        println!("\n=== Menu ===");
+        let menu_options = vec![
+            "REPL Mode (build as you go)",
+            "Add track (interactive)",
+            "Save project",
+            "Quit",
+        ];
+        
+        let menu_choice = Select::with_theme(&theme)
+            .with_prompt("Choose action")
+            .default(0)
+            .items(&menu_options)
+            .interact()
+            .unwrap();
+        
+        match menu_choice {
+            0 => {
+                repl_mode(&seq);
+            }
+            1 => {
+                if let Some(track) = create_track_interactive(&theme) {
+                    if let Ok(mut s) = seq.lock() {
+                        s.add_track(track);
+                        println!("✓ Track added (playing now!)");
+                    }
+                }
+            }
+            2 => {
+                save_project(&seq, &theme);
+            }
+            3 => {
+                println!("Goodbye! 🎵");
+                break;
+            }
+            _ => {}
+        }
     }
 }
-

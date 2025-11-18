@@ -1,0 +1,53 @@
+{
+  "tracks": [
+    {
+      "name": "moo",
+      "pattern": [
+        3,
+        5
+      ],
+      "octave": 3,
+      "transpose": 0,
+      "waveform": "Saw",
+      "voice_spread": 7
+    },
+    {
+      "name": "bass",
+      "pattern": [
+        3,
+        5
+      ],
+      "octave": 5,
+      "transpose": 0,
+      "waveform": "Square",
+      "voice_spread": 7
+    },
+    {
+      "name": "Synth",
+      "pattern": [
+        0,
+        3,
+        5,
+        7,
+        0,
+        5,
+        3,
+        0
+      ],
+      "octave": 1,
+      "transpose": 2,
+      "waveform": "Saw",
+      "voice_spread": 7
+    }
+  ],
+  "scale": [
+    7,
+    9,
+    10,
+    12,
+    14,
+    15,
+    17
+  ],
+  "bpm": 120.0
+}
